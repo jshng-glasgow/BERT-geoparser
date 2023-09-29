@@ -1,7 +1,7 @@
 # BERT-geoparser - Geolocation of textual data
 In this project we develop a model for geolocating textual data. The developed model is based on a BERT language model, trained on the task of identifying target and incidental locations in text. Given a textual input, we define a *target* location as any location directly related to the location of the writer (or the location that is the main subject of the text), and an *incidental* location as other locations which are mentioned, but do not relate to the location of writer. For example, consider the sentence:
 
-<p style="text-align: center;"> *"I am in Glasgow Airport waiting for a plane to Singapore."* </p>.
+<p style="text-align: center;"> "I am in Glasgow Airport waiting for a plane to Singapore."</p>
 
 In this sentence, *Glasgow Airport* is the target location and *Singapore* is an incidental location, unrelated to the true location of the writer. This project aims to construct a language model that is able to (a) identify locations in text (the easy bit) and (b) use the grammatical structure of the sentence to assign locations as either *target* or *incidental*.
 
