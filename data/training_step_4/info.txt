@@ -1,0 +1,1 @@
+This step requires text data tagged with target ([tar]) and incidental ([inc]) labels. This is produced in notebook 2.   

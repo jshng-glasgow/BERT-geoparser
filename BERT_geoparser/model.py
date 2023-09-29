@@ -1,0 +1,262 @@
+#!/usr/bin/env python3
+# standard library
+import json
+import sys
+import os
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+sys.path.append(os.path.dirname(SCRIPT_DIR))
+# third party
+import numpy as np
+import pandas as pd
+import tensorflow as tf
+from tensorflow import keras
+from tensorflow.keras import layers
+from tensorflow.keras.models import load_model
+from tensorflow.keras.callbacks import ModelCheckpoint
+from tensorflow.keras.losses import SparseCategoricalCrossentropy, Reduction
+from transformers import TFBertModel
+from tqdm import tqdm
+# local
+from BERT_geoparser.data import Data
+from BERT_geoparser.utils import convert, flatten
+
+class BertModel:
+    """A class to wrap the TFBertModel object from the transformers package. It 
+    is initialised with a BERT_geoparser.data.Data object, allowing for 
+    training and testing of newly trianed models.
+
+    attributes
+    ----------
+    loss_object : tf.keras.losses.SparseCategoricalCrossentropy
+        The loss function used for training the model.
+    model : tf.model
+        The tensorflow model object.
+    tag_dict : dict
+        The dictionary mapping tags (e.g. B-geo, I-per etc) to numeric codes 
+        used by the model. 
+    num_tags : int
+        The number of tags present in the data.
+    data : BERT_geoparser.data.Data
+        The data object on which to train/test the model. This is not mandatory
+        if using a pre-saved model.
+
+    """
+    def __init__(self, saved_model:str=None, data:Data=None):
+        self.loss_object = SparseCategoricalCrossentropy(from_logits=False, 
+                                                         reduction=Reduction.NONE)
+        if saved_model:
+            # Load a presaved model with custom ojects
+            custom_objects = {"TFBertModel": TFBertModel, 
+                              "masked_ce_loss":self.masked_ce_loss}
+
+            self.model = load_model(saved_model, 
+                                    custom_objects=custom_objects,
+                                    compile=False)
+            # load the model_config file
+            model_name = saved_model.replace('.hdf5', '')
+            with open(f'{model_name}_config.json', 'r') as f:
+                self.tag_dict = json.load(f)
+                self.num_tags = len(self.tag_dict)
+            # initialize the data object if specified
+            if data:
+                self.data = data
+        # if not using pre-saved model then data object must be passed
+        elif not data:
+            raise ValueError("Provide path to training data if not\
+                             using saved model") 
+        # initialize new attributes if not using save model.
+        else:
+            self.data = data
+            self.tag_dict = data.tag_dict
+            self.num_tags = len(self.tag_dict)
+            self.model = self.build_model()
+
+
+    def masked_ce_loss(self, true:list, pred:list)->float:
+        """A wrapper around the loss object to deal with padded data.
+        parameters
+        ----------
+        true : np.array
+            True values.
+        pred : np.array
+            Predicted values.
+        returns
+        -------
+        loss : float
+            The loss SCCE loss between 'true' and 'pred', accounting for any 
+            padding. 
+        """
+        # padding tag will be same as number of tags
+        mask = tf.math.logical_not(tf.math.equal(true, self.num_tags))
+        loss_ = self.loss_object(true, pred)
+        # crop any padding
+        mask = tf.cast(mask, dtype=loss_.dtype)
+        loss_ *= mask
+        return tf.reduce_mean(loss_)
+    
+    def build_model(self)->TFBertModel:
+        """Builds a BERT model which classfies indidual tokens into n_tags
+        categories.
+
+        returns
+        -------
+        model : tensorflow.model
+            An untrained TFBertModel with n_tags categories.
+        """
+        ## BERT encoder
+        encoder = TFBertModel.from_pretrained(str(self.data.tokenizer_obj))
+        ## NER Model
+        # inputs
+        input_ids = layers.Input(shape=(self.data.max_len,), dtype=tf.int32)
+        token_type_ids = layers.Input(shape=(self.data.max_len,), dtype=tf.int32)
+        attention_mask = layers.Input(shape=(self.data.max_len,), dtype=tf.int32)
+        # embedding
+        embedding = encoder(input_ids, token_type_ids=token_type_ids, 
+                            attention_mask=attention_mask)[0]
+        embedding = layers.Dropout(0.3)(embedding)
+        # output
+        tag_logits = layers.Dense(self.num_tags+1, activation='softmax')(embedding)
+        # build model
+        model = keras.Model(
+            inputs=[input_ids, token_type_ids, attention_mask],
+            outputs=[tag_logits],)
+        optimizer = keras.optimizers.Adam(lr=3e-5)
+        # compile
+        model.compile(optimizer=optimizer, loss=self.masked_ce_loss, metrics=['accuracy'])
+        return model
+    
+    def train(self, n_epochs:int=1, verbose:int=1, batch_size:int=16, 
+              validation_split:float=0.1, save_as:str=False)->None:
+        """Trains the compiled TFBertModel object on the supplied data.
+
+        parameters
+        ----------
+        n_epochs : int
+            Number of epochs for training.
+        verbose = int
+            Verbosity as per Tensorflow model.
+        batch_size : int
+            Number of sentences per batch.
+        validation_split : float < 1
+            Proportion of data used in model validation.
+        save_as : str
+            Filename for saving model.
+        
+        """
+        # get data
+        X, y = self.data.build_train_data()
+        # setup checkpoint
+        checkpoint = None
+        if save_as:
+            checkpoint = [ModelCheckpoint(filepath=save_as,
+                          save_weights_only=False,
+                          monitor='val_loss',
+                          mode='min',
+                          save_best_only=True)]
+            with open(f'{save_as[:-5]}_config.json', 'w') as out:
+                json.dump(self.tag_dict, out, default=convert)
+        # train 
+        self.model.fit(X, y, 
+                       epochs=n_epochs, 
+                       verbose=verbose, 
+                       batch_size=batch_size, 
+                       validation_split=validation_split, 
+                       callbacks=checkpoint)
+        
+    def test(self, test_data_path:str, return_tokens=False)->pd.DataFrame:
+        test_data = Data(test_data_path, 
+                         self.data.tokenizer_obj, 
+                         self.data.max_len)
+        
+        X_test, y_true = test_data.build_train_data()
+        y_pred = self.model.predict(X_test)
+
+        rev_tag_dict = {v:k for k,v in self.tag_dict.items()}
+        y_pred_tags = []
+        y_true_tags = []
+        X_test_tokens = []
+        for i, (yi_true, yi_pred) in enumerate(zip(y_true, y_pred)):
+            # strip padding from X and y:
+            len_padding = len([i for i in X_test[2][i] if i==0])
+            Xi_ids = X_test[0][i][:-len_padding]
+            yi_true_unpadded = yi_true[:-len_padding]
+            yi_pred_unpadded = yi_pred[:-len_padding]
+            # get the best guess for the predicted values
+            yi_pred_unpadded_vals = [np.argmax(yi) for yi in yi_pred_unpadded]
+            # convert from numeric labels to tags
+            y_true_tags.append([rev_tag_dict[yi] for yi in yi_true_unpadded])
+            y_pred_tags.append([rev_tag_dict[yi] for yi in yi_pred_unpadded_vals])
+            # get the tokens form the ids and updatee list
+            Xi_tokens = [self.data.tokenizer.id_to_token(x) for x in Xi_ids]
+            X_test_tokens.append(Xi_tokens)
+
+        if return_tokens:
+            return X_test_tokens, y_pred_tags, y_true_tags  
+        else:
+            return y_pred_tags, y_true_tags        
+
+
+    def predict(self, texts:list)->list:
+        """Uses the model to predict the tags for a list of sentences. 
+        
+        parameters
+        ----------
+        texts : list
+            A list of strings. These will be tokenized and the tags will be 
+            predicted.
+        
+        returns
+        -------
+        y_pred : list
+            A list of lists of tags relating to each token in the input 
+            sentences.
+        """
+        y_pred = []
+        for X_text in tqdm(texts):
+            X = self.data.build_input_from_text(X_text)
+            y_pred.append(self.model.predict(X, verbose=0))
+        return y_pred
+
+    def results_dataframe(self, texts:list, include_best:True)-> pd.DataFrame:
+        """Builds a dataframe showing the model output across a list of textual
+        inputs. Dataframe has columns "Sentence #', 'Word' and whichever tags 
+        are used in the model. Each row gives the predicted probability that a 
+        given word has each of the described tags.
+
+        parameters
+        ----------
+        texts : list
+            A list of strings to be parsed.
+        include_best : bool
+            If 'True' a 'Tag' column will be added with the best guess for each
+            word.
+
+        returns
+        -------
+        results : pd.DataFrame
+            A dataframe with the probability of each tag for each word, and, if
+            required, a 'Tag' column giving the best guess.
+
+        """
+        y_pred = self.predict(texts)
+        results_rows = []
+        
+        for i_sentence, pred in enumerate(y_pred):
+            X = self.data.build_input_from_text(texts[i_sentence])
+            X = [xi for xi in X[0][0] if xi != 0]
+            #row = {}
+            for i_word, Xi in enumerate(X):
+                # drop padding tags
+                token = self.data.tokenizer.id_to_token(Xi)
+                row = {'Sentence #':i_sentence, 'Word':token}
+                for tag, i_tag in self.tag_dict.items():
+                    confidence = pred[0][i_word][i_tag]
+                    row.update({tag:np.round(confidence, 3)})
+                
+                results_rows.append(row)
+        results = pd.DataFrame(results_rows)
+        tags = list(self.tag_dict.keys())
+        if include_best:
+            best = [tags[np.argmax(r)] for r in results[tags].values]
+            results['Tag'] = best
+        return results

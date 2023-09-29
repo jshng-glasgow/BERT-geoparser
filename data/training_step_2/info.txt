@@ -1,0 +1,5 @@
+Any geocoded textual dataset can be used here, although the notebooks demonstrate the use of the Yelp review data.
+
+The Yelp review data can be downloaded here https://www.yelp.com/dataset. 
+
+Both the `yelp_academic_dataset_review.json` and the `yelp_academic_dataset_business.json` datasets are required.

@@ -1,0 +1,3 @@
+The model uses an NER-Dataset. As this is quite a large dataset it has not been included in the repo. \n
+
+The dataset can be downloaded here https://www.kaggle.com/datasets/namanj27/ner-dataset
