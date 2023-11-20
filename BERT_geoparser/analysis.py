@@ -120,7 +120,10 @@ class Results:
         """
         cat_TP = self.categorical_TP(category)
         cat_FN = self.categorical_FN(category)
-        cat_recall = cat_TP/(cat_FN + cat_TP)
+        try:
+            cat_recall = cat_TP/(cat_FN + cat_TP)
+        except ZeroDivisionError:
+            cat_recall = 0
         return cat_recall
     
     def categorical_precision(self, category:str)->float:
@@ -137,7 +140,10 @@ class Results:
         """
         cat_TP = self.categorical_TP(category)
         cat_FP = self.categorical_FP(category)
-        cat_precision = cat_TP/(cat_TP + cat_FP)
+        try:
+            cat_precision = cat_TP/(cat_TP + cat_FP)
+        except ZeroDivisionError:
+            cat_precision = 0
         return cat_precision
     
     def macro_average_precision(self)->float:

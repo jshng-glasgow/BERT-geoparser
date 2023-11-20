@@ -10,8 +10,8 @@ import numpy as np
 import pandas as pd
 import tensorflow as tf
 from tensorflow import keras
-from tensorflow.keras import layers
-from tensorflow.keras.models import load_model
+from tensorflow.keras import layers, Model
+from tensorflow.keras.models import load_model, Sequential
 from tensorflow.keras.callbacks import ModelCheckpoint
 from tensorflow.keras.losses import SparseCategoricalCrossentropy, Reduction
 from transformers import TFBertModel
@@ -41,9 +41,13 @@ class BertModel:
         if using a pre-saved model.
 
     """
-    def __init__(self, saved_model:str=None, data:Data=None):
+    def __init__(self, saved_model:str=None, data:Data=None, **kwargs):
         self.loss_object = SparseCategoricalCrossentropy(from_logits=False, 
                                                          reduction=Reduction.NONE)
+        if 'lr' in kwargs.keys():
+            self.learning_rate=kwargs['lr']
+        if 'convolutional' in kwargs.keys():
+            self.convolutional=kwargs['convolutional']
         if saved_model:
             # Load a presaved model with custom ojects
             custom_objects = {"TFBertModel": TFBertModel, 
@@ -60,6 +64,21 @@ class BertModel:
             # initialize the data object if specified
             if data:
                 self.data = data
+                self.tag_dict = data.tag_dict
+                self.num_tags = len(self.tag_dict)
+        # replace output layer if required
+            if self.model.layers[-1].output_shape[-1] != self.num_tags + 1:
+                predictions = layers.Dense(self.num_tags+1, activation='softmax')(self.model.layers[-2].output)
+                new_model = Model(inputs=self.model.inputs, outputs=predictions)
+                optimizer = keras.optimizers.Adam(lr=self.learning_rate)                
+                # compile
+                new_model.compile(optimizer=optimizer, 
+                                  loss=self.masked_ce_loss, 
+                                  metrics=[self.masked_ce_loss], 
+                                  weighted_metrics=[self.masked_ce_loss],)
+                self.model = new_model
+
+
         # if not using pre-saved model then data object must be passed
         elif not data:
             raise ValueError("Provide path to training data if not\
@@ -69,7 +88,8 @@ class BertModel:
             self.data = data
             self.tag_dict = data.tag_dict
             self.num_tags = len(self.tag_dict)
-            self.model = self.build_model()
+            self.model = self.build_model(convolutional=self.convolutional)
+
 
 
     def masked_ce_loss(self, true:list, pred:list)->float:
@@ -94,7 +114,7 @@ class BertModel:
         loss_ *= mask
         return tf.reduce_mean(loss_)
     
-    def build_model(self)->TFBertModel:
+    def build_model(self, convolutional=True)->TFBertModel:
         """Builds a BERT model which classfies indidual tokens into n_tags
         categories.
 
@@ -114,19 +134,51 @@ class BertModel:
         embedding = encoder(input_ids, token_type_ids=token_type_ids, 
                             attention_mask=attention_mask)[0]
         embedding = layers.Dropout(0.3)(embedding)
+
+        if convolutional:
+            conv1d = layers.Conv1D(filters=16, kernel_size=3, padding='same')(embedding)
+            max_pool = layers.MaxPooling1D(pool_size=2, strides=1, padding='same')(conv1d)
+            #flat = layers.Flatten()(max_pool)
+            embedding=layers.Dense(1024, activation='relu')(max_pool)
+            embedding = layers.Dropout(0.3)(embedding)
+
         # output
         tag_logits = layers.Dense(self.num_tags+1, activation='softmax')(embedding)
         # build model
         model = keras.Model(
             inputs=[input_ids, token_type_ids, attention_mask],
             outputs=[tag_logits],)
-        optimizer = keras.optimizers.Adam(lr=3e-5)
+        optimizer = keras.optimizers.Adam(lr=self.learning_rate)
         # compile
-        model.compile(optimizer=optimizer, loss=self.masked_ce_loss, metrics=['accuracy'])
+        model.compile(optimizer=optimizer, 
+                      loss=self.masked_ce_loss, 
+                      metrics=[self.masked_ce_loss], 
+                      weighted_metrics=[self.masked_ce_loss],)
         return model
+
+    def get_sample_weights(self, class_weights:dict, y:np.array):
+        """Unfortunately class_weights do not work with sequential data in 
+        keras (as of 02/10/2023). We can get around this by using sample weights
+        and applying the appropriate class weight to each sample.
+        parameters
+        ----------
+        class_weights : dict
+            A dictionary mapping a numeric tag to a weight value.
+        y : np.array
+            The numeric tags for each sample in the data. 
+        returns
+        -------
+        sample weights : list
+            A list of length len(y) with the weight assigned to each sample.
+        """
+        sample_weights=[]
+        for y_sentence in y:
+            sample_weights.append([class_weights[yi] for yi in y_sentence])
+        return np.asarray(sample_weights)
+
     
     def train(self, n_epochs:int=1, verbose:int=1, batch_size:int=16, 
-              validation_split:float=0.1, save_as:str=False)->None:
+              validation_split:float=0.1, save_as:str=False, class_weights=None)->None:
         """Trains the compiled TFBertModel object on the supplied data.
 
         parameters
@@ -155,13 +207,19 @@ class BertModel:
                           save_best_only=True)]
             with open(f'{save_as[:-5]}_config.json', 'w') as out:
                 json.dump(self.tag_dict, out, default=convert)
+        # get sample weights
+        if class_weights:
+            sample_weights = self.get_sample_weights(class_weights, y)
+        else:
+            sample_weights = None
         # train 
         self.model.fit(X, y, 
                        epochs=n_epochs, 
                        verbose=verbose, 
                        batch_size=batch_size, 
                        validation_split=validation_split, 
-                       callbacks=checkpoint)
+                       callbacks=checkpoint,
+                       sample_weight=sample_weights)
         
     def test(self, test_data_path:str, return_tokens=False)->pd.DataFrame:
         test_data = Data(test_data_path, 
